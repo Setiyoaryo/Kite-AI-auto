@@ -1,0 +1,5 @@
+requests
+pytz
+eth-account
+cryptography
+rich
