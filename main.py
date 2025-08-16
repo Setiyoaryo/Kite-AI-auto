@@ -1,5 +1,7 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+from __future__ import annotations
 import os
 import re
 import sys
@@ -8,12 +10,11 @@ import json
 import random
 import datetime as dt
 from typing import Dict, List, Optional, Tuple
-
 import requests
 import pytz
 from eth_account import Account
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
+from requests.exceptions import ContentDecodingError, ChunkedEncodingError
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -23,12 +24,10 @@ from rich.theme import Theme
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 TZ = pytz.timezone("Asia/Jakarta")
-
 OZONE_BASE = "https://ozone-point-system.prod.gokite.ai"
 NEO_BASE = "https://neo.prod.gokite.ai"
 RPC_URL = "https://rpc-testnet.gokite.ai/"
 PANCAKE_RPC = "https://nodes.pancakeswap.info/"
-
 AUTH_SECRET_HEX = "6a1c35292b7c5b769ff47d89a17e7bc4f0adfe1b462981d28e0e9f7ff20b8f8a"
 
 AI_AGENTS: Dict[str, Dict[str, str]] = {
@@ -60,7 +59,6 @@ TOPIC_FILES: Dict[str, str] = {
 }
 
 GLOBAL_DAILY_CHAT_CAP = 9
-
 STAKE_MIN = 1.0
 SUBNETS: Dict[str, str] = {
     "Kite AI Agents": "0xb132001567650917d6bd695d1fab55db7986e9a5",
@@ -106,9 +104,15 @@ def is_valid_pk(pk: str) -> bool:
 
 def create_session(proxy: Optional[str]) -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) KITE-AI/3.0"})
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) KITE-AI/3.0",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "identity",
+        "Connection": "keep-alive",
+    })
     if proxy:
         s.proxies.update({"http": proxy, "https": proxy})
+    s.trust_env = False
     return s
 
 def aes_gcm_token(message: str, secret_hex: str) -> str:
@@ -136,31 +140,40 @@ def human_tdelta(seconds: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def request_json(session: requests.Session, method: str, url: str, **kwargs) -> dict:
-    r = session.request(method, url, **kwargs)
+    def _request(**kw):
+        return session.request(method, url, timeout=30, **kw)
+    r = _request(**kwargs)
     if r.status_code == 429:
         raise TooManyRequestsError("rate limited")
-    data = {}
     try:
         data = r.json()
-    except Exception:
-        r.raise_for_status()
-        return data
-    err = (data.get("error") or "").lower()
+    except (ValueError, ContentDecodingError, ChunkedEncodingError) as e:
+        retry_headers = dict(kwargs.get("headers") or {})
+        retry_headers["Accept-Encoding"] = "identity"
+        retry_kwargs = dict(kwargs)
+        retry_kwargs["headers"] = retry_headers
+        retry_kwargs["stream"] = False
+        r2 = _request(**retry_kwargs)
+        if r2.status_code == 429:
+            raise TooManyRequestsError("rate limited")
+        try:
+            data = r2.json()
+        except Exception:
+            try:
+                data = json.loads(r2.text)
+            except Exception:
+                raise e
+    err = (data.get("error") or "").lower() if isinstance(data, dict) else ""
     if "too many" in err or ("rate" in err and "limit" in err):
         raise TooManyRequestsError("rate limited")
     if r.status_code >= 400:
-        msg = data.get("error") or f"HTTP {r.status_code}"
+        msg = data.get("error") if isinstance(data, dict) else f"HTTP {r.status_code}"
         raise requests.HTTPError(msg, response=r)
     return data
 
 def rpc_eth_call_smart_account(session: requests.Session, eoa: str) -> str:
     data = "0x8cb84e18" + "0" * 24 + eoa[2:] + "4b6f5b36bb7706150b17e2eecb6e602b1b90b94a4bf355df57466626a5cb897b"
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "eth_call",
-        "params": [{"data": data, "to": "0x948f52524Bdf595b439e7ca78620A8f843612df3"}, "latest"],
-    }
+    payload = {"jsonrpc": "2.0", "id": 2, "method": "eth_call", "params": [{"data": data, "to": "0x948f52524Bdf595b439e7ca78620A8f843612df3"}, "latest"]}
     data = request_json(session, "POST", RPC_URL, json=payload, headers={"Content-Type": "application/json"})
     res = data.get("result", "")
     if not res or res == "0x":
@@ -170,27 +183,14 @@ def rpc_eth_call_smart_account(session: requests.Session, eoa: str) -> str:
 
 def signin_and_login(session: requests.Session, eoa: str, aa_address: str) -> Tuple[str, str]:
     auth_token = aes_gcm_token(eoa, AUTH_SECRET_HEX)
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "*/*",
-        "Authorization": auth_token,
-        "Origin": "https://testnet.gokite.ai",
-        "Referer": "https://testnet.gokite.ai/",
-    }
+    headers = {"Content-Type": "application/json", "Accept": "*/*", "Authorization": auth_token, "Origin": "https://testnet.gokite.ai", "Referer": "https://testnet.gokite.ai/"}
     payload = {"eoa": eoa, "aa_address": aa_address}
     data = request_json(session, "POST", f"{NEO_BASE}/v2/signin", json=payload, headers=headers)
     access_token = data.get("data", {}).get("access_token", "")
     if not access_token:
         raise RuntimeError("signin: missing access_token")
     headers2 = {"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"}
-    body = {
-        "registration_type_id": 1,
-        "user_account_id": "",
-        "user_account_name": "",
-        "eoa_address": eoa,
-        "smart_account_address": aa_address,
-        "referral_code": "",
-    }
+    body = {"registration_type_id": 1, "user_account_id": "", "user_account_name": "", "eoa_address": eoa, "smart_account_address": aa_address, "referral_code": ""}
     try:
         _ = request_json(session, "POST", f"{OZONE_BASE}/auth", json=body, headers=headers2)
     except requests.HTTPError as e:
@@ -218,35 +218,13 @@ def get_staked_totals(session: requests.Session, access_token: str) -> Tuple[flo
 
 def chat_ai(session: requests.Session, access_token: str, agent_name: str, eoa: str, message: str) -> dict:
     info = AI_AGENTS[agent_name]
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {access_token}",
-        "Origin": "https://testnet.gokite.ai",
-        "Referer": "https://testnet.gokite.ai/",
-    }
-    payload = {
-        "service_id": info["service_id"],
-        "subnet": info["subnet"],
-        "stream": False,
-        "body": {
-            "roomId": info["room"],
-            "userId": eoa,
-            "username": eoa,
-            "message": message,
-            "timeDiff": 0,
-            "date": "1608",
-        },
-    }
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {access_token}", "Origin": "https://testnet.gokite.ai", "Referer": "https://testnet.gokite.ai/"}
+    payload = {"service_id": info["service_id"], "subnet": info["subnet"], "stream": False, "body": {"roomId": info["room"], "userId": eoa, "username": eoa, "message": message, "timeDiff": 0, "date": "1608"}}
     return request_json(session, "POST", f"{OZONE_BASE}/agent/inference", json=payload, headers=headers)
 
 def submit_receipt(session: requests.Session, access_token: str, aa_address: str, service_id: str, message: str, reply: str) -> str:
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"}
-    body = {
-        "address": aa_address,
-        "service_id": service_id,
-        "input": [{"type": "text/plain", "value": message}],
-        "output": [{"type": "text/plain", "value": reply}],
-    }
+    body = {"address": aa_address, "service_id": service_id, "input": [{"type": "text/plain", "value": message}], "output": [{"type": "text/plain", "value": reply}]}
     data = request_json(session, "POST", f"{NEO_BASE}/v2/submit_receipt", json=body, headers=headers)
     rid = data.get("data", {}).get("id", "")
     if not rid:
@@ -259,8 +237,7 @@ def get_inference_tx(session: requests.Session, access_token: str, report_id: st
         try:
             data = request_json(session, "GET", f"{NEO_BASE}/v1/inference", params={"id": report_id}, headers=headers)
         except TooManyRequestsError:
-            sleep_seconds(wait_sec)
-            continue
+            sleep_seconds(wait_sec); continue
         txh = data.get("data", {}).get("tx_hash", "")
         if txh:
             return txh
@@ -331,13 +308,7 @@ def ensure_account_state(st: dict, address: str):
     for name in SUBNET_ORDER:
         addr = SUBNETS[name]
         if addr not in st["accounts"][address]["subnets"]:
-            st["accounts"][address]["subnets"][addr] = {
-                "name": name,
-                "staked": False,
-                "last_stake_at": None,
-                "last_claim_at": None,
-                "last_unstake_at": None,
-            }
+            st["accounts"][address]["subnets"][addr] = {"name": name, "staked": False, "last_stake_at": None, "last_claim_at": None, "last_unstake_at": None}
 
 def ts_now_iso() -> str:
     return now_jkt().isoformat()
@@ -505,12 +476,7 @@ def staking_cycle(session: requests.Session, access_token: str, address: str) ->
     state_save(st)
     return staked_count, claimed_count, unstaked_count
 
-def _send_one_chat(session: requests.Session,
-                   access_token: str,
-                   aa_address: str,
-                   address: str,
-                   agent_name: str,
-                   message: str) -> Tuple[bool, bool]:
+def _send_one_chat(session: requests.Session, access_token: str, aa_address: str, address: str, agent_name: str, message: str) -> Tuple[bool, bool]:
     service_id = AI_AGENTS[agent_name]["service_id"]
     try:
         resp = chat_ai(session, access_token, agent_name, address, message)
@@ -530,12 +496,7 @@ def _send_one_chat(session: requests.Session,
         console.print(f"   ❌ [err]{e}[/err]")
         return False, False
 
-def process_account(account_idx: int,
-                    address: str,
-                    private_key: str,
-                    proxy: Optional[str],
-                    chat_per_agent: int,
-                    topics: Dict[str, List[str]]) -> Tuple[int, int, bool]:
+def process_account(account_idx: int, address: str, private_key: str, proxy: Optional[str], chat_per_agent: int, topics: Dict[str, List[str]]) -> Tuple[int, int, bool]:
     success, failed = 0, 0
     short = f"{address[:8]}...{address[-6:]}"
     console.print(Rule(title=f"[title]Account {account_idx}[/title] • {short} • {now_str()}"))
