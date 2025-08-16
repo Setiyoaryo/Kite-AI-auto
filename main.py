@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-KITE AI Auto Runner + Staking Cycle
-- Chat global cap 9/hari (logika sebelumnya tetap)
-- Fitur staking:
-  Stake -> (>=24h) Claim -> Unstake -> Stake lagi (loop)
-  Jika saldo < 1 KITE: tampilkan deteksi posisi stake & countdown ke 24 jam
-- UI rich: hijau sukses, merah untuk 429 "Chat Dengan AI Agent sudah mencapai batas maksimal, Coba Lagi Besok!"
-"""
-
 from __future__ import annotations
 
 import os
@@ -26,18 +14,14 @@ import pytz
 from eth_account import Account
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-# === UI (rich) ===
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.rule import Rule
 from rich.prompt import IntPrompt, Confirm
 from rich.theme import Theme
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn
 
-# ==========================
-# Konfigurasi dasar
-# ==========================
 TZ = pytz.timezone("Asia/Jakarta")
 
 OZONE_BASE = "https://ozone-point-system.prod.gokite.ai"
@@ -45,10 +29,8 @@ NEO_BASE = "https://neo.prod.gokite.ai"
 RPC_URL = "https://rpc-testnet.gokite.ai/"
 PANCAKE_RPC = "https://nodes.pancakeswap.info/"
 
-# Secret AES-GCM untuk Authorization (hex 32-byte)
 AUTH_SECRET_HEX = "6a1c35292b7c5b769ff47d89a17e7bc4f0adfe1b462981d28e0e9f7ff20b8f8a"
 
-# Service ID untuk agent (chat)
 AI_AGENTS: Dict[str, Dict[str, str]] = {
     "Professor":     {"service_id": "deployment_BSfolnHm0er7rNprjQWYgNhQ", "subnet": "kite_ai_labs", "room": "ProfessorRoom"},
     "Crypto Buddy":  {"service_id": "deployment_l3QYj1avTiZz2vH2daFJBGu1", "subnet": "kite_ai_labs", "room": "CryptoBuddyRoom"},
@@ -65,7 +47,6 @@ AGENT_ORDER = [
     "Zane", "Vyn", "Avril", "Noa", "Diane", "Sakura",
 ]
 
-# File topik per agent
 TOPIC_FILES: Dict[str, str] = {
     "Professor": "pesan_professor.txt",
     "Crypto Buddy": "pesan_cryptobuddy.txt",
@@ -78,23 +59,19 @@ TOPIC_FILES: Dict[str, str] = {
     "Sakura": "pesan_sakura.txt",
 }
 
-# Global cap harian chat (dari requirement)
 GLOBAL_DAILY_CHAT_CAP = 9
 
-# === Staking ===
-STAKE_MIN = 1.0  # KITE
-# Subnet yang akan diputar untuk stake/claim/unstake
+STAKE_MIN = 1.0
 SUBNETS: Dict[str, str] = {
     "Kite AI Agents": "0xb132001567650917d6bd695d1fab55db7986e9a5",
     "Bitte":          "0xca312b44a57cc9fd60f37e6c9a343a1ad92a3b6c",
     "Bitmind":        "0xc368ae279275f80125284d16d292b650ecbbff8d",
 }
 SUBNET_ORDER = ["Kite AI Agents", "Bitte", "Bitmind"]
-STATE_FILE = "staking_state.json"  # simpan timestamp stake/claim/unstake per akun & subnet
+STATE_FILE = "staking_state.json"
 CLAIM_AFTER_HOURS = 24
 UNSTAKE_AFTER_HOURS = 24
 
-# === Console ===
 theme = Theme({
     "ok": "bold green",
     "err": "bold red",
@@ -106,12 +83,7 @@ theme = Theme({
 })
 console = Console(theme=theme)
 
-
-# ==========================
-# Util kecil
-# ==========================
 class TooManyRequestsError(Exception):
-    """429 / rate limit."""
     pass
 
 def now_jkt() -> dt.datetime:
@@ -145,7 +117,7 @@ def aes_gcm_token(message: str, secret_hex: str) -> str:
         raise ValueError("AUTH secret must be 32 bytes")
     iv = os.urandom(12)
     aes = AESGCM(key)
-    ct = aes.encrypt(iv, message.encode("utf-8"), None)  # ciphertext||tag
+    ct = aes.encrypt(iv, message.encode("utf-8"), None)
     return (iv + ct).hex()
 
 def sleep_seconds(sec: float):
@@ -163,10 +135,6 @@ def human_tdelta(seconds: int) -> str:
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-
-# ==========================
-# HTTP helper
-# ==========================
 def request_json(session: requests.Session, method: str, url: str, **kwargs) -> dict:
     r = session.request(method, url, **kwargs)
     if r.status_code == 429:
@@ -185,10 +153,6 @@ def request_json(session: requests.Session, method: str, url: str, **kwargs) -> 
         raise requests.HTTPError(msg, response=r)
     return data
 
-
-# ==========================
-# Auth & dasar
-# ==========================
 def rpc_eth_call_smart_account(session: requests.Session, eoa: str) -> str:
     data = "0x8cb84e18" + "0" * 24 + eoa[2:] + "4b6f5b36bb7706150b17e2eecb6e602b1b90b94a4bf355df57466626a5cb897b"
     payload = {
@@ -218,7 +182,6 @@ def signin_and_login(session: requests.Session, eoa: str, aa_address: str) -> Tu
     access_token = data.get("data", {}).get("access_token", "")
     if not access_token:
         raise RuntimeError("signin: missing access_token")
-
     headers2 = {"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"}
     body = {
         "registration_type_id": 1,
@@ -253,10 +216,6 @@ def get_staked_totals(session: requests.Session, access_token: str) -> Tuple[flo
     d = data.get("data", {}) or {}
     return float(d.get("total_staked_amount", 0.0)), float(d.get("total_claim_reward_amount", 0.0))
 
-
-# ==========================
-# Chat (ringkas, tetap ada)
-# ==========================
 def chat_ai(session: requests.Session, access_token: str, agent_name: str, eoa: str, message: str) -> dict:
     info = AI_AGENTS[agent_name]
     headers = {
@@ -300,17 +259,14 @@ def get_inference_tx(session: requests.Session, access_token: str, report_id: st
         try:
             data = request_json(session, "GET", f"{NEO_BASE}/v1/inference", params={"id": report_id}, headers=headers)
         except TooManyRequestsError:
-            sleep_seconds(wait_sec); continue
+            sleep_seconds(wait_sec)
+            continue
         txh = data.get("data", {}).get("tx_hash", "")
         if txh:
             return txh
         sleep_seconds(wait_sec)
     return ""
 
-
-# ==========================
-# Quiz
-# ==========================
 def create_quiz(session: requests.Session, access_token: str, eoa: str) -> str:
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"}
     today = now_jkt().strftime("%Y-%m-%d")
@@ -338,10 +294,6 @@ def submit_quiz(session: requests.Session, access_token: str, quiz_id: str, ques
     data = request_json(session, "POST", f"{NEO_BASE}/v2/quiz/submit", json=body, headers=headers)
     return bool(data.get("data", {}).get("result"))
 
-
-# ==========================
-# Sherlock helper (optional)
-# ==========================
 _TX_CACHE: List[str] = []
 def get_random_tx_hash(session: requests.Session) -> str:
     global _TX_CACHE
@@ -358,10 +310,6 @@ def get_random_tx_hash(session: requests.Session) -> str:
         return "0x" + "0"*64
     return random.choice(_TX_CACHE)
 
-
-# ==========================
-# Staking core
-# ==========================
 def state_load() -> dict:
     if not os.path.exists(STATE_FILE):
         return {"accounts": {}}
@@ -422,20 +370,10 @@ def undelegate(session: requests.Session, access_token: str, subnet_addr: str, a
     return request_json(session, "POST", f"{OZONE_BASE}/subnet/undelegate", json=body, headers=headers)
 
 def staking_cycle(session: requests.Session, access_token: str, address: str) -> Tuple[int, int, int]:
-    """
-    Jalankan siklus staking untuk semua subnet sesuai aturan:
-    - Jika belum stake & saldo >= 1 KITE -> stake 1
-    - Jika sudah >= 24h sejak stake -> claim, lalu coba unstake 1
-    - Jika saldo < 1: tampilkan countdown sisa waktu ke 24h, tetap coba claim
-    Returns: (staked_count, claimed_count, unstaked_count)
-    """
     st = state_load()
     ensure_account_state(st, address)
     acct = st["accounts"][address]["subnets"]
-
     staked_count = claimed_count = unstaked_count = 0
-
-    # Ambil saldo dan info total stake
     try:
         kite_bal, usdt_bal = get_balances(session, access_token)
     except TooManyRequestsError:
@@ -444,21 +382,16 @@ def staking_cycle(session: requests.Session, access_token: str, address: str) ->
     except Exception as e:
         console.print(f"  [warn]Balance fetch error: {e}[/warn]")
         kite_bal, usdt_bal = 0.0, 0.0
-
-    # Tabel info saldo awal
     table_bal = Table(title="Balances", header_style="info")
     table_bal.add_column("Token"); table_bal.add_column("Amount", justify="right")
     table_bal.add_row("KITE", f"{kite_bal:.6f}")
     table_bal.add_row("USDT", f"{usdt_bal:.6f}")
     console.print(table_bal)
-
-    # 1) Stake bila memungkinkan
     if kite_bal >= STAKE_MIN:
         console.print(Panel("Staking Phase", border_style="info"))
         for name in SUBNET_ORDER:
             subnet = SUBNETS[name]
             row = acct[subnet]
-            # Stake hanya jika belum staked (flag False)
             if not row["staked"] and kite_bal >= STAKE_MIN:
                 try:
                     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}")) as prog:
@@ -476,10 +409,8 @@ def staking_cycle(session: requests.Session, access_token: str, address: str) ->
                     return (staked_count, claimed_count, unstaked_count)
                 except Exception as e:
                     console.print(f"  ❌ [err]Stake {name} gagal: {e}[/err]")
-
     else:
         console.print(Panel("Saldo < 1 KITE — Skip staking baru. Deteksi posisi staking aktif:", border_style="warn"))
-        # tampilkan countdown
         det_table = Table(header_style="info", title="Active Stakes (Countdown to 24h)")
         det_table.add_column("Subnet")
         det_table.add_column("Staked?")
@@ -495,8 +426,6 @@ def staking_cycle(session: requests.Session, access_token: str, address: str) ->
             else:
                 det_table.add_row(name, "No", "-", "-")
         console.print(det_table)
-
-    # 2) Claim (bisa kapan pun, khususnya sesudah ≥24h)
     console.print(Panel("Claim Phase", border_style="info"))
     for name in SUBNET_ORDER:
         subnet = SUBNETS[name]
@@ -516,8 +445,6 @@ def staking_cycle(session: requests.Session, access_token: str, address: str) ->
                 return (staked_count, claimed_count, unstaked_count)
             except Exception as e:
                 console.print(f"  ❌ [err]Claim {name} gagal: {e}[/err]")
-
-    # 3) Unstake jika sudah ≥24h sejak stake
     console.print(Panel("Unstake Phase (≥ 24 jam)", border_style="info"))
     for name in SUBNET_ORDER:
         subnet = SUBNETS[name]
@@ -529,7 +456,6 @@ def staking_cycle(session: requests.Session, access_token: str, address: str) ->
                     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}")) as prog:
                         prog.add_task(description=f"Unstake 1 KITE from {name} …", total=None)
                         data = undelegate(session, access_token, subnet, 1)
-                    # Jika sukses, tandai tidak staked
                     console.print(f"  ✓ [ok]Unstaked 1 KITE from {name}[/ok]")
                     row["staked"] = False
                     row["last_unstake_at"] = ts_now_iso()
@@ -541,7 +467,6 @@ def staking_cycle(session: requests.Session, access_token: str, address: str) ->
                 except requests.HTTPError as e:
                     msg = str(e)
                     if "too short" in msg.lower():
-                        # Kurang dari 24 jam, tampilkan sisa waktu
                         to24s = int(24*3600 - hrs*3600)
                         console.print(f"  ⏳ [warn]{name}: Belum 24 jam, sisa {human_tdelta(to24s)}[/warn]")
                     else:
@@ -551,14 +476,10 @@ def staking_cycle(session: requests.Session, access_token: str, address: str) ->
             else:
                 to24 = int(24*3600 - hrs*3600)
                 console.print(f"  ⏳ {name}: tunggu {human_tdelta(to24)} untuk Unstake")
-
-    # 4) Setelah Unstake: coba Stake lagi jika saldo cukup (loop)
-    # Ambil ulang saldo
     try:
         kite_bal, _ = get_balances(session, access_token)
     except Exception:
         kite_bal = 0.0
-
     if kite_bal >= STAKE_MIN:
         console.print(Panel("Restake Phase (post-unstake)", border_style="info"))
         for name in SUBNET_ORDER:
@@ -581,24 +502,15 @@ def staking_cycle(session: requests.Session, access_token: str, address: str) ->
                     console.print(f"  ❌ [err]Re-stake {name} gagal: {e}[/err]")
     else:
         console.print("[muted]Saldo tidak cukup untuk re-stake saat ini.[/muted]")
-
     state_save(st)
     return staked_count, claimed_count, unstaked_count
 
-
-# ==========================
-# Orkestrasi chat per akun (diringkas untuk fokus fitur staking)
-# ==========================
 def _send_one_chat(session: requests.Session,
                    access_token: str,
                    aa_address: str,
                    address: str,
                    agent_name: str,
                    message: str) -> Tuple[bool, bool]:
-    """
-    Returns:
-      (success, rate_limited)
-    """
     service_id = AI_AGENTS[agent_name]["service_id"]
     try:
         resp = chat_ai(session, access_token, agent_name, address, message)
@@ -624,21 +536,13 @@ def process_account(account_idx: int,
                     proxy: Optional[str],
                     chat_per_agent: int,
                     topics: Dict[str, List[str]]) -> Tuple[int, int, bool]:
-    """
-    Returns:
-      success_count, fail_count, hit_global_limit_flag
-    """
     success, failed = 0, 0
     short = f"{address[:8]}...{address[-6:]}"
     console.print(Rule(title=f"[title]Account {account_idx}[/title] • {short} • {now_str()}"))
-
     meta_table = Table.grid(padding=1)
     meta_table.add_row("Proxy:", proxy or "[muted]-[/muted]")
     console.print(Panel(meta_table, title="Session", border_style="info"))
-
     session = create_session(proxy)
-
-    # Auth chain
     try:
         aa_address = rpc_eth_call_smart_account(session, address)
         console.print(f"✓ Smart account: [ok]{aa_address[:8]}...[/ok]")
@@ -648,7 +552,6 @@ def process_account(account_idx: int,
     except Exception as e:
         console.print(f"❌ [err]Failed to fetch smart account: {e}[/err]")
         return success, failed + 1, False
-
     try:
         _, access_token = signin_and_login(session, address, aa_address)
         console.print("✓ [ok]Authenticated & logged in[/ok]")
@@ -658,12 +561,9 @@ def process_account(account_idx: int,
     except Exception as e:
         console.print(f"❌ [err]Auth/login failed: {e}[/err]")
         return success, failed + 1, False
-
-    # ---- CHAT (global cap 9/hari dengan extra attempt kalau 1) ----
     total_success_today = 0
     consecutive_429 = 0
     hit_global_limit = False
-
     for agent_name in AGENT_ORDER:
         if total_success_today >= GLOBAL_DAILY_CHAT_CAP:
             break
@@ -696,7 +596,6 @@ def process_account(account_idx: int,
             sleep_seconds(2)
         if hit_global_limit:
             break
-
     if chat_per_agent == 1 and total_success_today < GLOBAL_DAILY_CHAT_CAP and not hit_global_limit:
         console.print(Panel("Extra Attempt Round (global cap balancing)", border_style="info"))
         for agent_name in AGENT_ORDER:
@@ -723,8 +622,6 @@ def process_account(account_idx: int,
                         hit_global_limit = True
                         break
             sleep_seconds(2)
-
-    # ---- QUIZ ----
     console.print(Panel("Daily Quiz", border_style="info"))
     try:
         qid = create_quiz(session, access_token, address)
@@ -742,17 +639,12 @@ def process_account(account_idx: int,
     except Exception as e:
         console.print(f"❌ [err]Quiz error: {e}[/err]")
         failed += 1
-
-    # ---- STAKING NEW FEATURE ----
     console.print(Panel("Staking Automation", border_style="title"))
     staked_c, claimed_c, unstaked_c = staking_cycle(session, access_token, address)
-
-    # ---- STATISTIK (me, balance, staked) ----
     try:
         uname, rank, xp = wallet_info(session, access_token)
         kite_bal, usdt_bal = get_balances(session, access_token)
         total_staked, total_claimed = get_staked_totals(session, access_token)
-
         stat = Table(title="Final Statistics", header_style="title", show_lines=True)
         stat.add_column("Field"); stat.add_column("Value", justify="right")
         stat.add_row("Username", uname)
@@ -766,21 +658,14 @@ def process_account(account_idx: int,
         console.print(stat)
     except Exception as e:
         console.print(f"[muted]Stats error: {e}[/muted]")
-
     return success, failed, hit_global_limit
 
 def run_cycle(chat_per_agent: int, use_proxy: bool) -> bool:
-    """
-    Returns:
-      hit_global_limit_any_account (bool)
-    """
-    # 1) Accounts
     acc_lines = read_lines("accounts.txt")
     if not acc_lines:
         console.print("[err]accounts.txt not found or empty! Fill one private key per line.[/err]")
         sys.exit(1)
-
-    accounts: List[Tuple[str, str]] = []  # (address, private_key)
+    accounts: List[Tuple[str, str]] = []
     for i, raw in enumerate(acc_lines, 1):
         pk = raw.strip()
         pk_norm = pk if pk.lower().startswith("0x") else "0x" + pk
@@ -794,8 +679,6 @@ def run_cycle(chat_per_agent: int, use_proxy: bool) -> bool:
             console.print(f"[err]Failed deriving address at line {i}: {e}[/err]")
             sys.exit(1)
         accounts.append((addr, pk_norm))
-
-    # 2) Proxies
     proxies: List[Optional[str]] = []
     if use_proxy:
         p_lines = read_lines("proxy.txt")
@@ -807,18 +690,13 @@ def run_cycle(chat_per_agent: int, use_proxy: bool) -> bool:
                 proxies.append(p_lines[i % len(p_lines)])
     else:
         proxies = [None] * len(accounts)
-
-    # 3) Topics
     topics: Dict[str, List[str]] = {}
     for agent, fname in TOPIC_FILES.items():
         t = read_lines(fname)
         t = [x for x in t if x and all(ord(ch) < 128 for ch in x)]
         topics[agent] = t
-
-    # 4) Process each account
     total_ok, total_fail = 0, 0
     hit_global_limit_any = False
-
     for idx, (addr, pk) in enumerate(accounts, 1):
         proxy = proxies[idx - 1] if proxies else None
         ok, fail, hit_limit = process_account(idx, addr, pk, proxy, chat_per_agent, topics)
@@ -826,14 +704,11 @@ def run_cycle(chat_per_agent: int, use_proxy: bool) -> bool:
         if hit_limit:
             hit_global_limit_any = True
             break
-
-    # Ringkasan
     table = Table(title="Cycle Summary", header_style="title")
     table.add_column("OK", justify="right", style="ok")
     table.add_column("Failed", justify="right", style="err")
     table.add_row(str(total_ok), str(total_fail))
     console.print(table)
-
     return hit_global_limit_any
 
 def countdown_to(next_time: dt.datetime):
@@ -850,15 +725,10 @@ def countdown_to(next_time: dt.datetime):
         sleep_seconds(1)
     console.print()
 
-
-# ==========================
-# Main
-# ==========================
 def main():
     console.print(Rule(title="[title]KITE AI Auto Runner + Staking[/title]"))
     chat_per_agent = IntPrompt.ask("Masukkan jumlah chat per agent", default=1, show_default=True)
     use_proxy = Confirm.ask("Gunakan proxy?", default=False)
-
     while True:
         console.print(Rule(title=f"[title]Start cycle @ {now_str()}[/title]"))
         try:
@@ -867,8 +737,6 @@ def main():
             console.print(f"[err]Uncaught error in cycle: {e}[/err]")
             hit_limit = False
         console.print(Rule(title=f"[title]Finished cycle @ {now_str()}[/title]"))
-
-        # Wajib tunggu 24 jam bila cap terpenuhi / rate limit keras
         next_run = now_jkt() + dt.timedelta(hours=24)
         countdown_to(next_run)
 
